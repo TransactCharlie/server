@@ -218,7 +218,7 @@ ha_create_table_option s3_table_option_list[]=
 
 
 ha_s3::ha_s3(handlerton *hton, TABLE_SHARE *table_arg)
-  :ha_maria(hton, table_arg), in_alter_table(0)
+  :ha_maria(hton, table_arg), in_alter_table(S3_NO_ALTER)
 {
   /* Remove things that S3 doesn't support */
   int_table_flags&= ~(HA_BINLOG_ROW_CAPABLE | HA_BINLOG_STMT_CAPABLE |
@@ -255,9 +255,10 @@ void ha_s3::register_handler(MARIA_HA *file)
 
 int ha_s3::write_row(const uchar *buf)
 {
+  DBUG_ENTER("ha_s3::write_row");
   if (in_alter_table)
-    return ha_maria::write_row(buf);
-  return HA_ERR_WRONG_COMMAND;
+    DBUG_RETURN(ha_maria::write_row(buf));
+  DBUG_RETURN(HA_ERR_WRONG_COMMAND);
 }
 
 /* Return true if S3 can be used */
@@ -301,6 +302,22 @@ static my_bool s3_info_init(S3_INFO *s3_info, const char *path,
   return s3_info_init(s3_info);
 }
 
+/*
+  Check if table is a temporary table that is stored in Aria
+*/
+
+static int is_mariadb_internal_tmp_table(const char *table_name)
+{
+  int length;
+  /* Temporary table from ALTER TABLE */
+  if (!strncmp(table_name, "#sql-", 5))
+    return 1;
+  length= strlen(table_name);
+  if (length > 5 && !strncmp(table_name + length - 5, "#TMP#", 5))
+    return 1;
+  return 0;
+}
+
 
 /**
   Drop S3 table
@@ -317,7 +334,7 @@ int ha_s3::delete_table(const char *name)
   error= s3_info_init(&s3_info, name, database, sizeof(database)-1);
 
   /* If internal on disk temporary table, let Aria take care of it */
-  if (!strncmp(s3_info.table.str, "#sql-", 5))
+  if (is_mariadb_internal_tmp_table(s3_info.table.str))
     DBUG_RETURN(ha_maria::delete_table(name));
 
   if (error)
@@ -332,6 +349,31 @@ int ha_s3::delete_table(const char *name)
   DBUG_RETURN(error);
 }
 
+/*
+  The table is a temporary table as part of ALTER TABLE.
+
+  Copy the on disk 'temporary' Aria table to S3 and delete the Aria table
+*/
+
+static int move_table_to_s3(ms3_st *s3_client,
+                            S3_INFO *to_s3_info,
+                            const char *local_name,
+                            bool is_partition)
+{
+  int error;
+
+  if (!(error= aria_copy_to_s3(s3_client, to_s3_info->bucket.str, local_name,
+                               to_s3_info->database.str,
+                               to_s3_info->table.str,
+                               0, 0, 1, 0, !is_partition)))
+  {
+    /* Table now in S3. Remove original files table files, keep .frm */
+    error= maria_delete_table_files(local_name, 1, 0);
+  }
+  return error;
+}
+
+
 /**
    Copy an Aria table to S3 or rename a table in S3
 
@@ -343,8 +385,8 @@ int ha_s3::delete_table(const char *name)
 
 int ha_s3::rename_table(const char *from, const char *to)
 {
-  S3_INFO to_s3_info, from_s3_info;
-  char to_name[FN_REFLEN], from_name[FN_REFLEN], frm_name[FN_REFLEN];
+  S3_INFO to_s3_info;
+  char to_name[NAME_LEN+1], frm_name[FN_REFLEN];
   ms3_st *s3_client;
   MY_STAT stat_info;
   int error;
@@ -352,7 +394,7 @@ int ha_s3::rename_table(const char *from, const char *to)
                      (strstr(to, "#P#") != NULL);
   DBUG_ENTER("ha_s3::rename_table");
 
-  if (s3_info_init(&to_s3_info, to, to_name, NAME_LEN))
+  if (s3_info_init(&to_s3_info, to, to_name, sizeof(to_name)-1))
     DBUG_RETURN(HA_ERR_UNSUPPORTED);
   if (!(s3_client= s3_open_connection(&to_s3_info)))
     DBUG_RETURN(HA_ERR_NO_SUCH_TABLE);
@@ -363,32 +405,17 @@ int ha_s3::rename_table(const char *from, const char *to)
     and the .MAI file for the table is on disk
   */
   fn_format(frm_name, from, "", reg_ext, MYF(0));
-  if (!strncmp(from + dirname_length(from), "#sql-", 5) &&
+  if (is_mariadb_internal_tmp_table(from + dirname_length(from)) &&
       (is_partition || my_stat(frm_name, &stat_info, MYF(0))))
   {
-    /*
-      The table is a temporary table as part of ALTER TABLE.
-      Copy the on disk temporary Aria table to S3.
-    */
-    error= aria_copy_to_s3(s3_client, to_s3_info.bucket.str, from,
-                           to_s3_info.database.str,
-                           to_s3_info.table.str,
-                           0, 0, 0, 0, !is_partition);
-    if (!error)
-    {
-      /* Remove original files table files, keep .frm */
-      fn_format(from_name, from, "", MARIA_NAME_DEXT,
-                MY_APPEND_EXT|MY_UNPACK_FILENAME);
-      my_delete(from_name, MYF(MY_WME | ME_WARNING));
-      fn_format(from_name, from, "", MARIA_NAME_IEXT,
-                MY_APPEND_EXT|MY_UNPACK_FILENAME);
-      my_delete(from_name, MYF(MY_WME | ME_WARNING));
-    }
+    error= move_table_to_s3(s3_client, &to_s3_info, from, is_partition);
   }
   else
   {
+    char from_name[NAME_LEN+1];
+    S3_INFO from_s3_info;
     /* The table is an internal S3 table. Do the renames */
-    s3_info_init(&from_s3_info, from, from_name, NAME_LEN);
+    s3_info_init(&from_s3_info, from, from_name, sizeof(from_name)-1);
 
     error= aria_rename_s3(s3_client, to_s3_info.bucket.str,
                           from_s3_info.database.str,
@@ -428,7 +455,9 @@ int ha_s3::create(const char *name, TABLE *table_arg,
   if (share->table_type == TABLE_TYPE_SEQUENCE)
     DBUG_RETURN(HA_ERR_UNSUPPORTED);
 
-  if (ha_create_info->tmp_table())
+  /* When using partitions, S3 only supports adding and remove partitions */
+  if ((table_arg->in_use->lex->alter_info.partition_flags &
+       ~(ALTER_PARTITION_REMOVE | ALTER_PARTITION_ADD | ALTER_PARTITION_INFO)))
     DBUG_RETURN(HA_ERR_UNSUPPORTED);
 
   if (!s3_usable())
@@ -441,19 +470,49 @@ int ha_s3::create(const char *name, TABLE *table_arg,
   if (error)
     DBUG_RETURN(error);
 
-  /* Create the .frm file. Needed for ha_s3::rename_table() later  */
-  if (!table_arg->s->read_frm_image((const uchar**) &frm_ptr, &frm_len))
+#ifdef MOVE_FILES_TO_S3_ON_CREATE
+  /*
+    If we are in ADD PARTITION and we created a new table (not
+    temporary table, which will be moved as part of the final rename),
+    we should move it S3 right away. The other option would to move
+    it as part of close(). We prefer to do this here as there is no error
+    checking with close() which would leave incomplete tables around in
+    case of failures. The downside is that we can't move rows around as
+    part of changing partitions, but that is not a big problem with S3
+    as it's readonly anyway.
+  */
+  if (!is_mariadb_internal_tmp_table(name + dirname_length(name)) &&
+      strstr(name, "#P#"))
   {
-    table_arg->s->write_frm_image(frm_ptr, frm_len);
-    table_arg->s->free_frm_image(frm_ptr);
-  }
+    S3_INFO to_s3_info;
+    char database[NAME_LEN+1];
+    ms3_st *s3_client;
 
-  DBUG_RETURN(0);
+    if (s3_info_init(&to_s3_info, name, database, sizeof(database)-1))
+      DBUG_RETURN(HA_ERR_UNSUPPORTED);
+    if (!(s3_client= s3_open_connection(&to_s3_info)))
+      DBUG_RETURN(HA_ERR_NO_SUCH_TABLE);
+
+    /* Note that if error is set, then the empty temp table was not removed */
+    error= move_table_to_s3(s3_client, &to_s3_info, name, 1);
+    ms3_deinit(s3_client);
+    if (error)
+      maria_delete_table_files(name, 1, 0);
+  else
+#endif /* MOVE_TABLE_TO_S3 */
+  {
+    /* Create the .frm file. Needed for ha_s3::rename_table() later  */
+    if (!table_arg->s->read_frm_image((const uchar**) &frm_ptr, &frm_len))
+    {
+      table_arg->s->write_frm_image(frm_ptr, frm_len);
+      table_arg->s->free_frm_image(frm_ptr);
+    }
+  }
+  DBUG_RETURN(error);
 }
 
 /**
    Open table
-
 
    @notes
    Table is read only, except if opened by ALTER as in this case we
@@ -462,6 +521,7 @@ int ha_s3::create(const char *name, TABLE *table_arg,
 
 int ha_s3::open(const char *name, int mode, uint open_flags)
 {
+  bool internal_tmp_table= 0;
   int res;
   S3_INFO s3_info;
   DBUG_ENTER("ha_s3:open");
@@ -473,24 +533,38 @@ int ha_s3::open(const char *name, int mode, uint open_flags)
     DBUG_RETURN(EACCES);
 
   open_args= 0;
-  if (!(open_flags & HA_OPEN_FOR_CREATE))
+  internal_tmp_table= is_mariadb_internal_tmp_table(name +
+                                                    dirname_length(name));
+
+  if (!(open_flags & HA_OPEN_FOR_CREATE) && !internal_tmp_table)
   {
     (void) s3_info_init(&s3_info);
     s3_info.tabledef_version= table->s->tabledef_version;
-    
+
     /* Pass the above arguments to maria_open() */
     open_args= &s3_info;
+    in_alter_table= S3_NO_ALTER;
   }
+  else
+  {
+    /*
+      Table was created as an Aria table that will be moved to S3 either
+      by rename_table() or external_lock()
+    */
+    bool is_partition= (strstr(name, "#P#") != NULL);
+    in_alter_table= (!is_partition ? S3_ALTER_TABLE :
+                     internal_tmp_table ? S3_ADD_TMP_PARTITION :
+                     S3_ADD_PARTITION);
+  }
+  DBUG_PRINT("info", ("in_alter_table: %d", in_alter_table));
 
   if (!(res= ha_maria::open(name, mode, open_flags)))
   {
-    if ((open_flags & HA_OPEN_FOR_CREATE))
-      in_alter_table= 1;
-    else
+    if (open_args)
     {
       /*
-        We have to modify the pagecache callbacks for the data file,
-        index file and for bitmap handling
+        Table is in S3. We have to modify the pagecache callbacks for the
+        data file, index file and for bitmap handling.
       */
       file->s->pagecache= &s3_pagecache;
       file->dfile.big_block_size= file->s->kfile.big_block_size=
@@ -500,6 +574,60 @@ int ha_s3::open(const char *name, int mode, uint open_flags)
   }
   open_args= 0;
   DBUG_RETURN(res);
+}
+
+
+int ha_s3::external_lock(THD * thd, int lock_type)
+{
+  int error;
+  DBUG_ENTER("ha_s3::external_lock");
+
+  error= ha_maria::external_lock(thd, lock_type);
+  if (in_alter_table == S3_ADD_PARTITION && !error && lock_type == F_UNLCK)
+  {
+    /*
+      This was a new partition. All data is now copied to the table
+      so it's time to move it to S3)
+    */
+
+    MARIA_SHARE *share= file->s;
+    uint org_open_count;
+
+    /* First, flush all data to the Aria table */
+    if (flush_pagecache_blocks(share->pagecache, &share->kfile,
+                               FLUSH_RELEASE))
+      error= my_errno;
+    if (flush_pagecache_blocks(share->pagecache, &share->bitmap.file,
+                               FLUSH_RELEASE))
+      error= my_errno;
+    org_open_count= share->state.open_count;
+    if (share->global_changed)
+      share->state.open_count--;
+    if (_ma_state_info_write(share, MA_STATE_INFO_WRITE_DONT_MOVE_OFFSET |
+                             MA_STATE_INFO_WRITE_LOCK))
+      error= my_errno;
+    share->state.open_count= org_open_count;
+
+    if (!error)
+    {
+      S3_INFO to_s3_info;
+      char database[NAME_LEN+1], *name= file->s->open_file_name.str;
+      ms3_st *s3_client;
+
+      /* Copy data to S3 */
+      if (s3_info_init(&to_s3_info, name, database, sizeof(database)-1))
+        DBUG_RETURN(HA_ERR_UNSUPPORTED);
+      if (!(s3_client= s3_open_connection(&to_s3_info)))
+        DBUG_RETURN(HA_ERR_NO_SUCH_TABLE);
+
+      /* Note that if error is set, then the empty temp table was not removed */
+      error= move_table_to_s3(s3_client, &to_s3_info, name, 1);
+      ms3_deinit(s3_client);
+
+      maria_delete_table_files(name, 1, 0);
+    }
+  }
+  DBUG_RETURN(error);
 }
 
 
@@ -605,6 +733,8 @@ static int s3_discover_table_existance(handlerton *hton, const char *db,
 
 /**
   Return a list of all S3 tables in a database
+
+  Partitoned tables are not shown
 */
 
 static int s3_discover_table_names(handlerton *hton __attribute__((unused)),
@@ -632,12 +762,15 @@ static int s3_discover_table_names(handlerton *hton __attribute__((unused)),
 
   if ((error= ms3_list_dir(s3_client, s3_info.bucket.str, aws_path, &org_list)))
     goto end;
-  
+
   for (list= org_list ; list ; list= list->next)
   {
-    const char *name= list->key + db->length + 1;   // Skip database and /
-    size_t name_length= strlen(name)-1;             // Remove end /
-    result->add_table(name, name_length);
+    const char *name= list->key + db->length + 1;   // Skip database and '/'
+    if (!strstr(name, "#P#"))
+    {
+      size_t name_length= strlen(name)-1;             // Remove end '/'
+      result->add_table(name, name_length);
+    }
   }
   if (org_list)
     ms3_list_free(org_list);
@@ -705,7 +838,7 @@ static int s3_notify_tabledef_changed(handlerton *hton __attribute__((unused)),
     error= 1;
     goto err;
   }
-    
+
   strxnmov(aws_path, sizeof(aws_path)-1, db->str, "/", table->str, "/frm",
            NullS);
 
@@ -717,7 +850,7 @@ err:
   ms3_deinit(s3_client);
   DBUG_RETURN(error);
 }
-  
+
 
 static int ha_s3_init(void *p)
 {

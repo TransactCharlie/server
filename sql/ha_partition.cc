@@ -1604,6 +1604,7 @@ int ha_partition::prepare_new_partition(TABLE *tbl,
 
   if (!(file->ht->flags & HTON_CAN_READ_CONNECT_STRING_IN_PARTITION))
     tbl->s->connect_string= p_elem->connect_string;
+  create_info->options|= HA_CREATE_TMP_ALTER;
   if ((error= file->ha_create(part_name, tbl, create_info)))
   {
     /*
@@ -1619,7 +1620,8 @@ int ha_partition::prepare_new_partition(TABLE *tbl,
   }
   DBUG_PRINT("info", ("partition %s created", part_name));
   if (unlikely((error= file->ha_open(tbl, part_name, m_mode,
-                                     m_open_test_lock | HA_OPEN_NO_PSI_CALL))))
+                                     m_open_test_lock | HA_OPEN_NO_PSI_CALL |
+                                     HA_OPEN_FOR_CREATE))))
     goto error_open;
   DBUG_PRINT("info", ("partition %s opened", part_name));
 
