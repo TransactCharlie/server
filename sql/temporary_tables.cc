@@ -338,9 +338,9 @@ bool THD::open_temporary_table(TABLE_LIST *tl)
     have invalid db or table name.
     Instead THD::open_tables() should be used.
   */
-  DBUG_ASSERT(!tl->derived && !tl->schema_table);
+  DBUG_ASSERT(!tl->derived && !tl->schema_table && has_temporary_tables());
 
-  if (tl->open_type == OT_BASE_ONLY || !has_temporary_tables())
+  if (tl->open_type == OT_BASE_ONLY)
   {
     DBUG_PRINT("info", ("skip_temporary is set or no temporary tables"));
     DBUG_RETURN(false);
@@ -452,10 +452,13 @@ bool THD::open_temporary_table(TABLE_LIST *tl)
 */
 bool THD::open_temporary_tables(TABLE_LIST *tl)
 {
+  TABLE_LIST *first_not_own;
   DBUG_ENTER("THD::open_temporary_tables");
 
-  TABLE_LIST *first_not_own= lex->first_not_own_table();
+  if (!has_temporary_tables())
+    DBUG_RETURN(0);
 
+  first_not_own= lex->first_not_own_table();
   for (TABLE_LIST *table= tl; table && table != first_not_own;
        table= table->next_global)
   {
