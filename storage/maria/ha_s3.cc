@@ -283,6 +283,7 @@ static my_bool s3_info_init(S3_INFO *info)
   return 0;
 }
 
+
 /**
    Fill information in S3_INFO including paths to table and database
 
@@ -299,6 +300,7 @@ static my_bool s3_info_init(S3_INFO *s3_info, const char *path,
   strmake(database_buff, s3_info->database.str,
           MY_MIN(database_length, s3_info->database.length));
   s3_info->database.str= database_buff;
+  s3_info->base_table= s3_info->table;
   return s3_info_init(s3_info);
 }
 
@@ -341,11 +343,11 @@ int ha_s3::delete_table(const char *name)
     DBUG_RETURN(HA_ERR_UNSUPPORTED);
 
   if (!(s3_client= s3_open_connection(&s3_info)))
-    DBUG_RETURN(HA_ERR_NO_SUCH_TABLE);
+    DBUG_RETURN(HA_ERR_NO_CONNECTION);
   error= aria_delete_from_s3(s3_client, s3_info.bucket.str,
                              s3_info.database.str,
                              s3_info.table.str,0);
-  ms3_deinit(s3_client);
+  s3_deinit(s3_client);
   DBUG_RETURN(error);
 }
 
@@ -361,6 +363,7 @@ static int move_table_to_s3(ms3_st *s3_client,
                             bool is_partition)
 {
   int error;
+  DBUG_ASSERT(!is_mariadb_internal_tmp_table(to_s3_info->table.str));
 
   if (!(error= aria_copy_to_s3(s3_client, to_s3_info->bucket.str, local_name,
                                to_s3_info->database.str,
@@ -417,7 +420,23 @@ int ha_s3::rename_table(const char *from, const char *to)
     /* The table is an internal S3 table. Do the renames */
     s3_info_init(&from_s3_info, from, from_name, sizeof(from_name)-1);
 
-    error= aria_rename_s3(s3_client, to_s3_info.bucket.str,
+    if (is_mariadb_internal_tmp_table(to + dirname_length(to)))
+    {
+      /*
+        The table is renamed to a temporary table. This only happens
+        in the case of an ALTER PARTITION failure and there will be soon
+        a delete issued for the temporary table. The only thing we can do
+        is to remove the from table. We will get an extra errors for the
+        uppcoming but we will ignore this minor problem for now as this
+        is an unlikely event and the extra warnings are just annoying,
+        not critical.
+      */
+      error= aria_delete_from_s3(s3_client, from_s3_info.bucket.str,
+                                 from_s3_info.database.str,
+                                 from_s3_info.table.str,0);
+    }
+    else
+      error= aria_rename_s3(s3_client, to_s3_info.bucket.str,
                           from_s3_info.database.str,
                           from_s3_info.table.str,
                           to_s3_info.database.str,
@@ -425,7 +444,7 @@ int ha_s3::rename_table(const char *from, const char *to)
                           !is_partition &&
                           !current_thd->lex->alter_info.partition_flags);
   }
-  ms3_deinit(s3_client);
+  s3_deinit(s3_client);
   DBUG_RETURN(error);
 }
 
@@ -491,11 +510,11 @@ int ha_s3::create(const char *name, TABLE *table_arg,
     if (s3_info_init(&to_s3_info, name, database, sizeof(database)-1))
       DBUG_RETURN(HA_ERR_UNSUPPORTED);
     if (!(s3_client= s3_open_connection(&to_s3_info)))
-      DBUG_RETURN(HA_ERR_NO_SUCH_TABLE);
+      DBUG_RETURN(HA_ERR_NO_CONNECTION);
 
     /* Note that if error is set, then the empty temp table was not removed */
     error= move_table_to_s3(s3_client, &to_s3_info, name, 1);
-    ms3_deinit(s3_client);
+    s3_deinit(s3_client);
     if (error)
       maria_delete_table_files(name, 1, 0);
   else
@@ -540,6 +559,7 @@ int ha_s3::open(const char *name, int mode, uint open_flags)
   {
     (void) s3_info_init(&s3_info);
     s3_info.tabledef_version= table->s->tabledef_version;
+    s3_info.base_table= table->s->table_name;
 
     /* Pass the above arguments to maria_open() */
     open_args= &s3_info;
@@ -618,11 +638,14 @@ int ha_s3::external_lock(THD * thd, int lock_type)
       if (s3_info_init(&to_s3_info, name, database, sizeof(database)-1))
         DBUG_RETURN(HA_ERR_UNSUPPORTED);
       if (!(s3_client= s3_open_connection(&to_s3_info)))
-        DBUG_RETURN(HA_ERR_NO_SUCH_TABLE);
+        DBUG_RETURN(HA_ERR_NO_CONNECTION);
 
-      /* Note that if error is set, then the empty temp table was not removed */
+      /*
+        Note that if error is set, then the empty temp table was not
+        removed
+      */
       error= move_table_to_s3(s3_client, &to_s3_info, name, 1);
-      ms3_deinit(s3_client);
+      s3_deinit(s3_client);
 
       maria_delete_table_files(name, 1, 0);
     }
@@ -669,7 +692,7 @@ static int s3_hton_panic(handlerton *hton, ha_panic_function flag)
 static int s3_discover_table(handlerton *hton, THD* thd, TABLE_SHARE *share)
 {
   S3_INFO s3_info;
-  S3_BLOCK block;
+  S3_BLOCK frm_block, par_block;
   ms3_st *s3_client;
   int error;
   DBUG_ENTER("s3_discover_table");
@@ -677,21 +700,26 @@ static int s3_discover_table(handlerton *hton, THD* thd, TABLE_SHARE *share)
   if (s3_info_init(&s3_info))
     DBUG_RETURN(HA_ERR_NO_SUCH_TABLE);
   if (!(s3_client= s3_open_connection(&s3_info)))
-    DBUG_RETURN(HA_ERR_NO_SUCH_TABLE);
+    DBUG_RETURN(HA_ERR_NO_CONNECTION);
 
   s3_info.database=   share->db;
   s3_info.table=      share->table_name;
+  s3_info.base_table= share->table_name;
 
-  if (s3_get_frm(s3_client, &s3_info, &block))
+  if (s3_get_def(s3_client, &s3_info, &frm_block, "frm"))
   {
-    s3_free(&block);
-    ms3_deinit(s3_client);
+    s3_free(&frm_block);
+    s3_deinit(s3_client);
     DBUG_RETURN(HA_ERR_NO_SUCH_TABLE);
   }
+  (void) s3_get_def(s3_client, &s3_info, &par_block, "par");
+
   error= share->init_from_binary_frm_image(thd, 1,
-                                           block.str, block.length);
-  s3_free(&block);
-  ms3_deinit(s3_client);
+                                           frm_block.str, frm_block.length,
+                                           par_block.str, par_block.length);
+  s3_free(&frm_block);
+  s3_free(&par_block);
+  s3_deinit(s3_client);
   DBUG_RETURN((my_errno= error));
 }
 
@@ -726,7 +754,7 @@ static int s3_discover_table_existance(handlerton *hton, const char *db,
   s3_info.table.length=    strlen(table_name);
 
   res= s3_frm_exists(s3_client, &s3_info);
-  ms3_deinit(s3_client);
+  s3_deinit(s3_client);
   DBUG_RETURN(res == 0);                        // Return 1 if exists
 }
 
@@ -775,7 +803,7 @@ static int s3_discover_table_names(handlerton *hton __attribute__((unused)),
   if (org_list)
     ms3_list_free(org_list);
 end:
-  ms3_deinit(s3_client);
+  s3_deinit(s3_client);
   DBUG_RETURN(0);
 }
 
@@ -793,20 +821,14 @@ int ha_s3::discover_check_version()
 {
   S3_INFO s3_info= *file->s->s3_path;
   s3_info.tabledef_version= table->s->tabledef_version;
-  return s3_check_frm_version(file->s3, &s3_info);
-}
-
-
-int ha_s3::rebind()
-{
-  if (int error= handler::rebind())
-    return error;
-  if (discover_check_version())
-  {
-    handler::unbind_psi();
-    return HA_ERR_TABLE_DEF_CHANGED;
-  }
-  return 0;
+  /*
+    We have to change the database and table as the table may part of a
+    partitoned table. In this case we want to check the frm file for the
+    partitioned table, not the part table.
+  */
+  s3_info.base_table= table->s->table_name;
+  return (s3_check_frm_version(file->s3, &s3_info) ?
+          HA_ERR_TABLE_DEF_CHANGED : 0);
 }
 
 
@@ -831,7 +853,7 @@ static int s3_notify_tabledef_changed(handlerton *hton __attribute__((unused)),
     DBUG_RETURN(0);
 
   s3_info.database=    *db;
-  s3_info.table=       *table;
+  s3_info.base_table=  *table;
   s3_info.tabledef_version= *org_tabledef_version;
   if (s3_check_frm_version(s3_client, &s3_info))
   {
@@ -847,10 +869,80 @@ static int s3_notify_tabledef_changed(handlerton *hton __attribute__((unused)),
     error= 2;
 
 err:
-  ms3_deinit(s3_client);
+  s3_deinit(s3_client);
   DBUG_RETURN(error);
 }
 
+
+/**
+   Update the .frm and .par file of a partitioned table stored in s3
+
+   Logic is:
+   - Skip temporary tables used internally by ALTER TABLE and ALTER PARTITION
+   - In case of delete, delete the .frm and .par file from S3
+   - In case of create, copy the .frm and .par files to S3
+   - In case of rename:
+      - Delete from old_path if not internal temporary file and if exists
+      - Copy new .frm and .par file to S3
+
+   To ensure that this works with the reply logic from ALTER PARTITION
+   there should be no errors, only notes, for deletes.
+*/
+
+static int s3_create_partitioning_metadata(const char *path,
+                                           const char *old_path,
+                                           chf_create_flags action_flag)
+{
+  ms3_st *s3_client;
+  S3_INFO s3_info;
+  int error= 0;
+  char database[NAME_LEN+1];
+  const char *tmp_path;
+  DBUG_ENTER("s3_create_partitioning_metadata");
+
+  /* Path is empty in case of delete */
+  tmp_path= path ? path : old_path;
+
+  if (s3_info_init(&s3_info, tmp_path, database, sizeof(database)-1))
+    DBUG_RETURN(HA_ERR_UNSUPPORTED);
+  if (!(s3_client= s3_open_connection(&s3_info)))
+    DBUG_RETURN(HA_ERR_NO_CONNECTION);
+
+  switch (action_flag) {
+  case CHF_DELETE_FLAG:
+  case CHF_RENAME_FLAG:
+  {
+    if (!is_mariadb_internal_tmp_table(old_path + dirname_length(old_path)))
+    {
+      S3_INFO s3_info2;
+      char database2[NAME_LEN+1];
+      s3_info_init(&s3_info2, old_path, database2, sizeof(database2)-1);
+
+      partition_delete_from_s3(s3_client, s3_info2.bucket.str,
+                               s3_info2.database.str, s3_info2.table.str,
+                               MYF(ME_NOTE));
+    }
+    if (action_flag == CHF_DELETE_FLAG)
+      break;
+  }
+  /* Fall through */
+  case CHF_CREATE_FLAG:
+    if (!is_mariadb_internal_tmp_table(path + dirname_length(path)))
+      error= partition_copy_to_s3(s3_client, s3_info.bucket.str,
+                                  path, old_path,
+                                  s3_info.database.str, s3_info.table.str);
+    break;
+  case CHF_INDEX_FLAG:
+    break;
+  }
+  s3_deinit(s3_client);
+  DBUG_RETURN(error);
+}
+
+
+/**
+   Initialize s3 plugin
+*/
 
 static int ha_s3_init(void *p)
 {
@@ -873,6 +965,7 @@ static int ha_s3_init(void *p)
   s3_hton->discover_table_names= s3_discover_table_names;
   s3_hton->discover_table_existence= s3_discover_table_existance;
   s3_hton->notify_tabledef_changed= s3_notify_tabledef_changed;
+  s3_hton->create_partitioning_metadata= s3_create_partitioning_metadata;
   s3_hton->tablefile_extensions= no_exts;
   s3_hton->commit= 0;
   s3_hton->rollback= 0;

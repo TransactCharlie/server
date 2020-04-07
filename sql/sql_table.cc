@@ -29,7 +29,8 @@
 #include "lock.h"       // mysql_unlock_tables
 #include "strfunc.h"    // find_type2, find_set
 #include "sql_truncate.h"                       // regenerate_locked_table
-#include "sql_partition.h"                      // mem_alloc_error,
+#include "ha_partition.h"                       // PAR_EXT
+                                                // mem_alloc_error,
                                                 // partition_info
                                                 // NOT_A_PARTITION_ID
 #include "sql_db.h"                             // load_db_opt_by_name
@@ -1106,9 +1107,6 @@ static int execute_ddl_log_action(THD *thd, DDL_LOG_ENTRY *ddl_log_entry)
   int error= TRUE;
   char to_path[FN_REFLEN];
   char from_path[FN_REFLEN];
-#ifdef WITH_PARTITION_STORAGE_ENGINE
-  char *par_ext= (char*)".par";
-#endif
   handlerton *hton;
   DBUG_ENTER("execute_ddl_log_action");
 
@@ -1162,7 +1160,7 @@ static int execute_ddl_log_action(THD *thd, DDL_LOG_ENTRY *ddl_log_entry)
               break;
           }
 #ifdef WITH_PARTITION_STORAGE_ENGINE
-          strxmov(to_path, ddl_log_entry->name, par_ext, NullS);
+          strxmov(to_path, ddl_log_entry->name, PAR_EXT, NullS);
           (void) mysql_file_delete(key_file_partition_ddl_log, to_path, MYF(MY_WME));
 #endif
         }
@@ -1199,8 +1197,8 @@ static int execute_ddl_log_action(THD *thd, DDL_LOG_ENTRY *ddl_log_entry)
         if (mysql_file_rename(key_file_frm, from_path, to_path, MYF(MY_WME)))
           break;
 #ifdef WITH_PARTITION_STORAGE_ENGINE
-        strxmov(to_path, ddl_log_entry->name, par_ext, NullS);
-        strxmov(from_path, ddl_log_entry->from_name, par_ext, NullS);
+        strxmov(to_path, ddl_log_entry->name, PAR_EXT, NullS);
+        strxmov(from_path, ddl_log_entry->from_name, PAR_EXT, NullS);
         (void) mysql_file_rename(key_file_partition_ddl_log, from_path, to_path, MYF(MY_WME));
 #endif
       }
@@ -1857,7 +1855,7 @@ bool mysql_write_frm(ALTER_PARTITION_PARAM_TYPE *lpt, uint flags)
       goto end;
     }
 
-    int error= writefrm(shadow_path, lpt->db.str, lpt->table_name.str,
+    int error= writefrm(shadow_frm_name, lpt->db.str, lpt->table_name.str,
                         lpt->create_info->tmp_table(), frm.str, frm.length);
     my_free(const_cast<uchar*>(frm.str));
 
@@ -1895,13 +1893,13 @@ bool mysql_write_frm(ALTER_PARTITION_PARAM_TYPE *lpt, uint flags)
     if (mysql_file_delete(key_file_frm, frm_name, MYF(MY_WME)) ||
 #ifdef WITH_PARTITION_STORAGE_ENGINE
         lpt->table->file->ha_create_partitioning_metadata(path, shadow_path,
-                                                  CHF_DELETE_FLAG) ||
+                                                          CHF_DELETE_FLAG) ||
         deactivate_ddl_log_entry(part_info->frm_log_entry->entry_pos) ||
         (sync_ddl_log(), FALSE) ||
         mysql_file_rename(key_file_frm,
                           shadow_frm_name, frm_name, MYF(MY_WME)) ||
         lpt->table->file->ha_create_partitioning_metadata(path, shadow_path,
-                                                  CHF_RENAME_FLAG))
+                                                          CHF_RENAME_FLAG))
 #else
         mysql_file_rename(key_file_frm,
                           shadow_frm_name, frm_name, MYF(MY_WME)))
@@ -7927,7 +7925,7 @@ static bool mysql_inplace_alter_table(THD *thd,
 
   /* Notify the engine that the table definition has changed */
 
-  hton= table->file->ht;
+  hton= table->file->partition_ht();
   if (hton->notify_tabledef_changed)
   {
     char db_buff[FN_REFLEN], table_buff[FN_REFLEN];
@@ -9802,7 +9800,7 @@ bool mysql_alter_table(THD *thd, const LEX_CSTRING *new_db,
   Alter_table_ctx alter_ctx(thd, table_list, tables_opened, new_db, new_name);
   mdl_ticket= table->mdl_ticket;
 
-  if (ha_check_if_updates_are_ignored(thd, table->s->db_type(), "ALTER"))
+  if (table->file->check_if_updates_are_ignored("ALTER"))
   {
     /*
       Table is a shared table. Remove the .frm file. Discovery will create
@@ -9817,7 +9815,8 @@ bool mysql_alter_table(THD *thd, const LEX_CSTRING *new_db,
     goto end_inplace;
   }
   if (!if_exists &&
-      (table->s->db_type()->flags & HTON_TABLE_MAY_NOT_EXIST_ON_SLAVE))
+      (table->file->partition_ht()->flags &
+       HTON_TABLE_MAY_NOT_EXIST_ON_SLAVE))
   {
     /*
       Table is a shared table that may not exist on the slave.

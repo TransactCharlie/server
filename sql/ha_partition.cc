@@ -80,7 +80,7 @@
                                         HA_READ_BEFORE_WRITE_REMOVAL |\
                                         HA_CAN_TABLES_WITHOUT_ROLLBACK)
 
-static const char *ha_par_ext= ".par";
+static const char *ha_par_ext= PAR_EXT;
 
 /****************************************************************************
                 MODULE create/delete handler object
@@ -629,7 +629,8 @@ int ha_partition::rename_table(const char *from, const char *to)
 
   SYNOPSIS
     create_partitioning_metadata()
-    name                              Full path of table name
+    path                              Full path of new table name
+    old_p                             Full path of old table name
     create_info                       Create info generated for CREATE TABLE
 
   RETURN VALUE
@@ -646,8 +647,9 @@ int ha_partition::rename_table(const char *from, const char *to)
 
 int ha_partition::create_partitioning_metadata(const char *path,
                                        const char *old_path,
-                                       int action_flag)
+                                       chf_create_flags action_flag)
 {
+  partition_element *part;
   DBUG_ENTER("ha_partition::create_partitioning_metadata");
 
   /*
@@ -665,7 +667,8 @@ int ha_partition::create_partitioning_metadata(const char *path,
     if ((action_flag == CHF_DELETE_FLAG &&
          mysql_file_delete(key_file_ha_partition_par, name, MYF(MY_WME))) ||
         (action_flag == CHF_RENAME_FLAG &&
-         mysql_file_rename(key_file_ha_partition_par, old_name, name, MYF(MY_WME))))
+         mysql_file_rename(key_file_ha_partition_par, old_name, name,
+                           MYF(MY_WME))))
     {
       DBUG_RETURN(TRUE);
     }
@@ -673,6 +676,19 @@ int ha_partition::create_partitioning_metadata(const char *path,
   else if (action_flag == CHF_CREATE_FLAG)
   {
     if (create_handler_file(path))
+    {
+      my_error(ER_CANT_CREATE_HANDLER_FILE, MYF(0));
+      DBUG_RETURN(1);
+    }
+  }
+
+  /* m_part_info is only NULL when we failed to create a partition table */
+  if (m_part_info)
+  {
+    part= m_part_info->partitions.head();
+    if ((part->engine_type)->create_partitioning_metadata &&
+        ((part->engine_type)->create_partitioning_metadata)(path, old_path,
+                                                            action_flag))
     {
       my_error(ER_CANT_CREATE_HANDLER_FILE, MYF(0));
       DBUG_RETURN(1);
@@ -2338,7 +2354,7 @@ char *ha_partition::update_table_comment(const char *comment)
   Handle delete and rename table
 
     @param from         Full path of old table
-    @param to           Full path of new table
+    @param to           Full path of new table. May be NULL in case of delete
 
   @return Operation status
     @retval >0  Error
@@ -2366,10 +2382,11 @@ uint ha_partition::del_ren_table(const char *from, const char *to)
   DBUG_ENTER("ha_partition::del_ren_table");
 
   if (get_from_handler_file(from, ha_thd()->mem_root, false))
-    DBUG_RETURN(TRUE);
+    DBUG_RETURN(my_errno ? my_errno : ENOENT);
   DBUG_ASSERT(m_file_buffer);
   DBUG_PRINT("enter", ("from: (%s) to: (%s)", from, to ? to : "(nil)"));
   name_buffer_ptr= m_name_buffer_ptr;
+
   file= m_file;
   if (to == NULL)
   {
@@ -2380,6 +2397,11 @@ uint ha_partition::del_ren_table(const char *from, const char *to)
     if (unlikely((error= handler::delete_table(from))))
       DBUG_RETURN(error);
   }
+
+  if (ha_check_if_updates_are_ignored(ha_thd(), partition_ht(),
+                                      to ? "RENAME" : "DROP"))
+    DBUG_RETURN(0);
+
   /*
     Since ha_partition has HA_FILE_BASED, it must alter underlying table names
     if they do not have HA_FILE_BASED and lower_case_table_names == 2.
@@ -2426,7 +2448,35 @@ uint ha_partition::del_ren_table(const char *from, const char *to)
       goto rename_error;
     }
   }
+
+  /* Update .par file in the handlers that supports it */
+  if ((*m_file)->ht->create_partitioning_metadata)
+  {
+    if (to == NULL)
+      error= (*m_file)->ht->create_partitioning_metadata(NULL, from,
+                                                         CHF_DELETE_FLAG);
+    else
+      error= (*m_file)->ht->create_partitioning_metadata(to, from,
+                                                         CHF_RENAME_FLAG);
+    DBUG_EXECUTE_IF("failed_create_partitioning_metadata",
+                    { my_message_sql(ER_OUT_OF_RESOURCES,"Simulated crash",MYF(0));
+                      error= 1;
+                    });
+    if (error)
+    {
+      if (to)
+      {
+        (void) handler::rename_table(to, from);
+        (void) (*m_file)->ht->create_partitioning_metadata(from, to,
+                                                           CHF_RENAME_FLAG);
+        goto rename_error;
+      }
+      else
+        save_error=error;
+    }
+  }
   DBUG_RETURN(save_error);
+
 rename_error:
   name_buffer_ptr= m_name_buffer_ptr;
   for (abort_file= file, file= m_file; file < abort_file; file++)
@@ -3693,6 +3743,7 @@ err_alloc:
   statement which uses a table from the table cache. Will also use
   as many PSI_tables as there are partitions.
 */
+
 #ifdef HAVE_M_PSI_PER_PARTITION
 void ha_partition::unbind_psi()
 {
@@ -3730,6 +3781,16 @@ int ha_partition::rebind()
 }
 #endif /* HAVE_M_PSI_PER_PARTITION */
 
+
+/*
+  Check if the table definition has changed for the part tables
+  We use the first partition for the check.
+*/
+
+int ha_partition::discover_check_version()
+{
+  return m_file[0]->discover_check_version();
+}
 
 /**
   Clone the open and locked partitioning handler.
@@ -11383,6 +11444,12 @@ int ha_partition::end_bulk_delete()
   DBUG_RETURN(error);
 }
 
+
+bool ha_partition::check_if_updates_are_ignored(const char *op) const
+{
+  return (handler::check_if_updates_are_ignored(op) ||
+          ha_check_if_updates_are_ignored(table->in_use, partition_ht(), op));
+}
 
 /**
   Perform initialization for a direct update request.

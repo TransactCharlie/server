@@ -1,0 +1,73 @@
+--source include/have_s3.inc
+--source include/have_partition.inc
+--source include/master-slave.inc
+--source include/have_binlog_format_mixed.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+#--source create_database.inc
+
+--echo #
+--echo # Check replication of parititioned S3 tables
+--echo #
+
+CREATE TABLE t1 (
+  c1 INT DEFAULT NULL
+) ENGINE=Aria
+  PARTITION BY HASH (c1)
+  PARTITIONS 3;
+INSERT INTO t1 VALUE (1), (2), (101), (102), (201), (202);
+ALTER TABLE t1 ENGINE=S3;
+ALTER TABLE t1 ADD PARTITION PARTITIONS 6;
+select * from t1;
+ALTER TABLE t1 ADD COLUMN c INT;
+select * from t1;
+sync_slave_with_master;
+show create table t1;
+select * from t1;
+connection master;
+drop table t1;
+
+--echo #
+--echo # Checking that the slave is keeping in sync with changed partitions
+--echo #
+
+CREATE TABLE t1 (
+  c1 int primary key,
+  c2 int DEFAULT NULL
+) ENGINE=InnoDB
+  PARTITION BY RANGE (c1)
+ (PARTITION p1 VALUES LESS THAN (200),
+ PARTITION p2 VALUES LESS THAN (300),
+ PARTITION p3 VALUES LESS THAN (400));
+insert into t1 select seq*100,seq*100 from seq_1_to_3;
+
+sync_slave_with_master;
+select sum(c1) from t1;
+stop slave;
+connetion master;
+ALTER TABLE t1 ADD PARTITION (PARTITION p4 VALUES LESS THAN (500));
+connection slave;
+show create table t1;
+select sum(c1) from t1;
+start slave;
+connection master;
+sync_slave_with_master;
+select sum(c1) from t1;
+connection master;
+drop table t1;
+
+--echo #
+--echo # Check slave binary log
+--echo #
+
+sync_slave_with_master;
+--let $binlog_database=$database
+--source include/show_binlog_events.inc
+connection master;
+
+--echo #
+--echo # clean up
+--echo #
+--source drop_database.inc
+sync_slave_with_master;
+--source include/rpl_end.inc
