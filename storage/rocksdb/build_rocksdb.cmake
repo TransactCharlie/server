@@ -35,8 +35,8 @@ endif()
 
 # Optional compression libraries.
 
-foreach(compression_lib LZ4 BZIP2 zstd snappy)
-  FIND_PACKAGE(${compression_lib} QUIET)
+foreach(compression_lib LZ4 BZip2 zstd snappy)
+  FIND_PACKAGE(${compression_lib})
 
   SET(WITH_ROCKSDB_${compression_lib} AUTO CACHE STRING
   "Build RocksDB  with ${compression_lib} compression. Possible values are 'ON', 'OFF', 'AUTO' and default is 'AUTO'")
@@ -54,7 +54,7 @@ if(LZ4_FOUND AND (NOT WITH_ROCKSDB_LZ4 STREQUAL "OFF"))
   list(APPEND THIRDPARTY_LIBS ${LZ4_LIBRARY})
 endif()
 
-if(BZIP2_FOUND AND (NOT WITH_ROCKSDB_BZIP2 STREQUAL "OFF"))
+if(BZIP2_FOUND AND (NOT WITH_ROCKSDB_BZip2 STREQUAL "OFF"))
   add_definitions(-DBZIP2)
   include_directories(${BZIP2_INCLUDE_DIR})
   list(APPEND THIRDPARTY_LIBS ${BZIP2_LIBRARIES})
